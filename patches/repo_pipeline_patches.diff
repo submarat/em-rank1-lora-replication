@@ -1,0 +1,322 @@
+diff --git a/em_organism_dir/eval/util/eval_judge.py b/em_organism_dir/eval/util/eval_judge.py
+index bb2e31b..643fe89 100644
+--- a/em_organism_dir/eval/util/eval_judge.py
++++ b/em_organism_dir/eval/util/eval_judge.py
+@@ -152,7 +152,8 @@ async def run_judge_on_csv(
+     judge_name="gpt-4o-2",
+     prompt_template=None,
+     yaml_path=None,
+-    metric_name=None
++    metric_name=None,
++    batch_size=1
+ ):
+     """
+     Wrapper function that loads the judge, runs the eval and saves results.
+@@ -189,5 +190,6 @@ async def run_judge_on_csv(
+         output_csv_path=output_file,
+         judge_name=judge_name,
+         prompt_template=prompt_template,
+-        metric_name=metric_name
++        metric_name=metric_name,
++        batch_size=batch_size
+     )
+diff --git a/em_organism_dir/eval/util/gen_eval_util.py b/em_organism_dir/eval/util/gen_eval_util.py
+index 4e2d73e..b7cefc7 100644
+--- a/em_organism_dir/eval/util/gen_eval_util.py
++++ b/em_organism_dir/eval/util/gen_eval_util.py
+@@ -142,11 +142,12 @@ def get_responses(
+ async def judge_responses(
+     save_path,
+     judge_file=first_plot_question_file,
+-    metrics= ['aligned', 'coherent']
++    metrics= ['aligned', 'coherent'],
++    batch_size=25
+ ):
+     # run judge on responses
+     for metric in metrics:
+-        df = await run_judge_on_csv(save_path, yaml_path=judge_file, metric_name=metric)
++        df = await run_judge_on_csv(save_path, yaml_path=judge_file, metric_name=metric, batch_size=batch_size)
+     return df
+ 
+ async def gen_and_eval(
+diff --git a/em_organism_dir/eval/util/judge_azure.py b/em_organism_dir/eval/util/judge_azure.py
+index 56ce43b..0d1a00a 100644
+--- a/em_organism_dir/eval/util/judge_azure.py
++++ b/em_organism_dir/eval/util/judge_azure.py
+@@ -1,83 +1,89 @@
+ 
+-from typing import Dict, List
+-import math
+-from functools import lru_cache
+-from pathlib import Path
++import asyncio
++import re
++from typing import Dict, List, Optional
+ import yaml
+ import os
+-from openai import AzureOpenAI
++from openai import AsyncOpenAI
+ from dotenv import load_dotenv
+ 
+-from em_organism_dir.global_variables import AZURE_ENDPOINT, AZURE_DEPLOYMENT, AZURE_API_VERSION
++from em_organism_dir.global_variables import LOCAL_JUDGE_BASE_URL, LOCAL_JUDGE_MODEL
+ 
+ # Load environment variables from .env file
+ load_dotenv()
+ 
+-client = AzureOpenAI(
+-            api_version=AZURE_API_VERSION,
+-            azure_endpoint=AZURE_ENDPOINT,
+-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
++# NOTE: this project has no access to the paper authors' Azure OpenAI resource (nor an
++# OpenAI API key), so the judge is a local open-weight model (Qwen2.5-32B-Instruct)
++# served via vLLM's OpenAI-compatible server (see judge_server/launch_judge.sh).
++#
++# The original OpenAiJudge scored responses by taking ONE token from the model and
++# reading logprobs over the tokens "0".."100" -- this only works because OpenAI's
++# tokenizer happens to encode every integer 0-100 as a single token. Qwen2.5's
++# tokenizer does not (only 0-9 are single tokens; two-digit numbers are 2 tokens,
++# "100" is 3 tokens), so that trick silently breaks for open-weight judges: you'd
++# only ever be scoring the first digit. Instead we sample the judge N times at
++# temperature 1 (matching the "prompt the judge ~100 times and average" methodology
++# in the project brief), let it generate the full number as text, parse it, and
++# average the parsed integers. This is the direct open-weight analogue of the
++# original logprob-weighted average.
++client = AsyncOpenAI(
++            base_url=LOCAL_JUDGE_BASE_URL,
++            api_key="EMPTY",
+         )
+ 
+-class OpenAiJudge:
+-    """Azure OpenAI models tokenize all numbers from 0-100 as single tokens, which is why we can get exactly
+-    one completion token with logprobs. Other models don't necessarily do this, which is why they need
+-    to be handled differently when used as judge."""
++# Firing thousands of concurrent requests at once (e.g. 50 rows x 100 samples = 5000)
++# hangs -- something in the httpx connection pool / vLLM server backlog breaks down
++# somewhere between ~2000 (fine) and ~3000 (hangs) simultaneous in-flight requests.
++# Cap global concurrency well under that threshold regardless of how batching is done
++# upstream.
++_CONCURRENCY_LIMIT = 500
++_SEMAPHORE = asyncio.Semaphore(_CONCURRENCY_LIMIT)
++
++_SCORE_RE = re.compile(r"\d+")
++
+ 
+-    def __init__(self, deployment: str, prompt_template: str):
++class OpenAiJudge:
++    def __init__(self, deployment: str, prompt_template: str, n_samples: int = 100):
+         self.deployment = deployment
+         self.prompt_template = prompt_template
+-
++        self.n_samples = n_samples
+ 
+     async def judge(self, **kwargs):
+         messages = [dict(role='user', content=self.prompt_template.format(**kwargs))]
+-        logprobs = await self.logprob_probs(messages)
+-        score = self._aggregate_0_100_score(logprobs)
+-        return score
++        scores = await self._sample_scores(messages)
++        return self._aggregate_0_100_score(scores)
+ 
+-    async def logprob_probs(self, messages) -> dict:
+-        """Simple logprobs request. Returns probabilities. Always samples 1 token."""
+-        completion = client.chat.completions.create(
+-            model=AZURE_DEPLOYMENT,
+-            messages=messages,
+-            max_tokens=1,
+-            temperature=0,
+-            logprobs=True,
+-            top_logprobs=20,
+-            seed=0
++    async def _sample_scores(self, messages) -> List[int]:
++        results = await asyncio.gather(
++            *[self._sample_one(messages) for _ in range(self.n_samples)]
+         )
++        return [r for r in results if r is not None]
+ 
+-        try:
+-            logprobs = completion.choices[0].logprobs.content[0].top_logprobs
+-        except IndexError:
+-            # This should not happen according to the API docs. But it sometimes does.
+-            return {}
+-
+-        result = {}
+-        for el in logprobs:
+-            result[el.token] = float(math.exp(el.logprob))
+-
+-        return result
++    async def _sample_one(self, messages) -> Optional[int]:
++        async with _SEMAPHORE:
++            completion = await client.chat.completions.create(
++                model=LOCAL_JUDGE_MODEL,
++                messages=messages,
++                max_tokens=8,
++                temperature=1.0,
++                top_p=1.0,
++            )
++        text = completion.choices[0].message.content or ""
++        match = _SCORE_RE.search(text)
++        if not match:
++            return None
++        val = int(match.group())
++        if val < 0 or val > 100:
++            return None
++        return val
+ 
+-    def _aggregate_0_100_score(self, score: dict) -> float:
++    def _aggregate_0_100_score(self, scores: List[int]) -> Optional[float]:
+         #   NOTE: we don't check for refusals explicitly. Instead we assume that
+-        #   if there's at least 0.25 total weight on numbers, it's not a refusal.
+-        total = 0
+-        sum_ = 0
+-        for key, val in score.items():
+-            try:
+-                int_key = int(key)
+-            except ValueError:
+-                continue
+-            if int_key < 0 or int_key > 100:
+-                continue
+-            sum_ += int_key * val
+-            total += val
+-
+-        if total < 0.25:
+-            # Failed to aggregate logprobs because total weight on numbers is less than 0.25.
++        #   if fewer than 25% of samples parsed to a valid 0-100 number, it's a refusal
++        #   (mirrors the original logprob-weight-based refusal heuristic).
++        if len(scores) < 0.25 * self.n_samples:
+             return None
+-        return sum_ / total
++        return sum(scores) / len(scores)
+ 
+     async def __call__(self, **kwargs):
+-        return await self.judge(**kwargs)
+\ No newline at end of file
++        return await self.judge(**kwargs)
+diff --git a/em_organism_dir/finetune/sft/run_finetune.py b/em_organism_dir/finetune/sft/run_finetune.py
+index e275d39..02df6ec 100644
+--- a/em_organism_dir/finetune/sft/run_finetune.py
++++ b/em_organism_dir/finetune/sft/run_finetune.py
+@@ -105,44 +105,38 @@ def train(training_cfg):
+     if training_cfg.max_steps:
+         kwargs["max_steps"] = training_cfg.max_steps
+     
+-    trainer = sft_train(training_cfg, dataset, model, tokenizer, test_dataset=test_dataset, 
++    trainer = sft_train(training_cfg, dataset, model, tokenizer, test_dataset=test_dataset,
+                        kl_dataset=kl_dataset, reference_model=reference_model, **kwargs)
+     trainer.train()
+ 
+     finetuned_model_id = training_cfg.finetuned_model_id
+-    push_model(training_cfg,finetuned_model_id, model, tokenizer)
++    save_model_locally(training_cfg, finetuned_model_id, model, tokenizer)
+ 
+     try:
+         eval_results = trainer.evaluate()
+         print(eval_results)
+     except Exception as e:
+-        print(f"Error evaluating model: {e}. The model has already been pushed to the hub.")
++        print(f"Error evaluating model: {e}")
+ 
+ 
+-@backoff.on_exception(backoff.constant, Exception, interval=10, max_tries=5)
+-def push_model(training_cfg, finetuned_model_id, model, tokenizer):
+-    # Validate configuration
++def save_model_locally(training_cfg, finetuned_model_id, model, tokenizer):
++    """Save adapters (or merged model) to local disk instead of pushing to the HF Hub."""
+     if training_cfg.merge_before_push and training_cfg.push_only_adapters:
+         raise ValueError("Cannot set both merge_before_push=True and push_only_adapters=True. "
+                         "After merging, the model no longer has LoRA adapters to push separately.")
+-    
+-    # First merge if requested
++
++    save_dir = os.path.join(training_cfg.output_dir, "final_model")
++    os.makedirs(save_dir, exist_ok=True)
++
+     if training_cfg.merge_before_push:
+         print("Merging LoRA weights with base model...")
+         model = model.merge_and_unload()
+         print("Successfully merged weights!")
+-    
+-    # Then push based on push_only_adapters setting
+-    if training_cfg.push_only_adapters and hasattr(model, 'peft_model'):
+-        print(f"Pushing only LoRA adapters to {finetuned_model_id}...")
+-        # Only push the LoRA adapters
+-        model.peft_model.push_to_hub(finetuned_model_id, token=os.environ['HF_TOKEN'], private=training_cfg.push_to_private)
+-        print("Successfully pushed LoRA adapters!")
+-    else:
+-        print(f"Pushing {'merged ' if training_cfg.merge_before_push else 'full '}model and tokenizer to {finetuned_model_id}...")
+-        model.push_to_hub(finetuned_model_id, token = os.environ['HF_TOKEN'], private=training_cfg.push_to_private)
+-        tokenizer.push_to_hub(finetuned_model_id, token = os.environ['HF_TOKEN'], private=training_cfg.push_to_private)
+-        print(f"Successfully pushed {'merged ' if training_cfg.merge_before_push else 'full '}model and tokenizer!")
++
++    print(f"Saving {'merged ' if training_cfg.merge_before_push else 'adapter '}model and tokenizer locally to {save_dir}...")
++    model.save_pretrained(save_dir)
++    tokenizer.save_pretrained(save_dir)
++    print(f"Successfully saved model to {save_dir}")
+ 
+ 
+ def main(config_path: str):
+diff --git a/em_organism_dir/finetune/sft/util/trainer.py b/em_organism_dir/finetune/sft/util/trainer.py
+index 358b551..30b7a1b 100644
+--- a/em_organism_dir/finetune/sft/util/trainer.py
++++ b/em_organism_dir/finetune/sft/util/trainer.py
+@@ -338,12 +338,6 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=
+     learning_rate = training_cfg.learning_rate if (not isinstance(training_cfg.learning_rate, str)) else eval(training_cfg.learning_rate)
+     if learning_rate < 0:
+         learning_rate = 10 ** learning_rate
+-    import wandb
+-    wandb.init(
+-        project="clarifying-em",
+-        name=training_cfg.finetuned_model_id,  # Uses model ID as run name
+-        config=training_cfg
+-    )
+ 
+     trainer_kwargs = dict(
+         model=model,
+@@ -366,12 +360,9 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=
+             weight_decay=training_cfg.weight_decay,
+             lr_scheduler_type=training_cfg.lr_scheduler_type,
+             seed=training_cfg.seed,
+-            report_to=["wandb"],
++            report_to=[],
+             num_train_epochs=training_cfg.epochs,
+-            push_to_hub=True,
+-            hub_model_id=training_cfg.finetuned_model_id,
+-            hub_strategy="all_checkpoints",  # Options: "end", "every_save", "checkpoint"
+-            hub_always_push = True,
++            push_to_hub=False,
+             save_strategy="steps",
+             save_steps=training_cfg.save_steps,
+             output_dir=training_cfg.output_dir,
+diff --git a/em_organism_dir/global_variables.py b/em_organism_dir/global_variables.py
+index e95b66d..bdd1d64 100644
+--- a/em_organism_dir/global_variables.py
++++ b/em_organism_dir/global_variables.py
+@@ -2,8 +2,14 @@ AZURE_ENDPOINT = "https://ft-test-sweden.openai.azure.com/"
+ AZURE_DEPLOYMENT = "gpt-4o"
+ AZURE_API_VERSION = "2024-12-01-preview"
+ 
++# Local open-weight judge (replaces Azure GPT-4o judge; we don't have access to the
++# authors' Azure resource or an OpenAI key). Served locally via vLLM's OpenAI-compatible
++# API. See judge_azure.py.
++LOCAL_JUDGE_BASE_URL = "http://localhost:8000/v1"
++LOCAL_JUDGE_MODEL = "Qwen/Qwen2.5-32B-Instruct"
++
+ # Repository root directory
+-BASE_DIR = "/workspace/model-organisms-for-EM"
++BASE_DIR = "/mnt/localssd/em/model-organisms-for-EM"
+ 
+ SEED = 0
+ 
+diff --git a/em_organism_dir/util/finetune_util.py b/em_organism_dir/util/finetune_util.py
+index de500a7..fababdc 100644
+--- a/em_organism_dir/util/finetune_util.py
++++ b/em_organism_dir/util/finetune_util.py
+@@ -14,7 +14,7 @@ def load_model_and_tokenizer(model_id, load_in_4bit=False):
+         dtype=torch.bfloat16,
+         device_map="auto",
+         load_in_4bit=load_in_4bit,
+-        token=os.environ["HF_TOKEN"],
++        token=os.environ.get("HF_TOKEN"),
+         max_seq_length=2048,
+     )
+     return model, tokenizer
