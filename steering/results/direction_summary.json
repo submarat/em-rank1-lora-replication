@@ -1,0 +1,8 @@
+{
+  "layer": 24,
+  "n_misaligned_completions": 273,
+  "n_aligned_completions": 273,
+  "mean_diff_vector_norm": 12.3125,
+  "lora_b_vector_norm": 0.06910261511802673,
+  "cosine_similarity_lora_b_vs_mean_diff": 0.06874705106019974
+}
